@@ -1,0 +1,68 @@
+---
+title: Replacing PagerDuty AIOps with a Small Alert Gateway
+excerpt: Where Pingdom alerts come from, what happens to them on the way, and how a tiny serverless gateway grouped them into one incident without a paid add-on.
+date: 2026-10-09
+tags: [PagerDuty, AWS Lambda, Alerting]
+minutes: 6
+sample: false
+---
+
+When ten URLs of one environment go down together, you want one page, not ten. Our setup did that, but only because of a paid PagerDuty add-on. Here is how I rebuilt the same behaviour in front of PagerDuty.
+
+## Where the alerts come from
+
+Pingdom and Uptime Kuma check our URLs. When a check fails, the tool sends a **webhook**, which is just an HTTPS request with a JSON body, to PagerDuty.
+
+That raw message is messy. The title is inconsistent, the environment is not stated, and there is nothing that tells PagerDuty which alerts belong together.
+
+## What the add-on was doing
+
+PagerDuty AIOps did two jobs inside PagerDuty, after the alert arrived:
+
+1. It rewrote the title into a standard form.
+2. It grouped alerts that shared an environment and severity into one incident.
+
+Turn it off and both jobs vanish.
+
+## Moving the work earlier
+
+PagerDuty has a free feature on every plan: if two events carry the same `dedup_key` and an incident is open, they merge into that incident. So I only needed to send events that already have a good title and a good key.
+
+I put a **gateway** in the path.
+
+## Architecture
+
+<Arch title="From a failing URL to one PagerDuty incident" layers={[
+  { label: "Sources", link: "none", gap: "webhook with a secret header", nodes: [{ t: "Pingdom", tone: "accent" }, { t: "Uptime Kuma", tone: "accent" }] },
+  { label: "Gateway (AWS)", nodes: [{ t: "API Gateway", sub: "front door and secret check" }, { t: "Lambda", sub: "the gateway logic", tone: "accent" }, { t: "DynamoDB", sub: "5-minute memory", tone: "ext" }], gap: "final, already-correct event" },
+  { label: "PagerDuty", nodes: [{ t: "Events API v2" }, { t: "One incident per environment", tone: "status" }] },
+]} />
+
+For each alert, the Lambda:
+
+1. Reads the payload and turns it into one common shape.
+2. Works out the environment from the hostname or tags.
+3. Builds the title, for example `P1 | staging | URL Down | <url>`.
+4. Creates the key from environment and severity.
+5. Remembers which URLs are down for that key during the last five minutes.
+6. Sends the finished event to PagerDuty.
+
+PagerDuty now does no transformation at all. It only merges events with the same key, and the incident lists every affected URL.
+
+## Why DynamoDB
+
+A Lambda forgets everything between calls, but the five-minute window needs memory. DynamoDB gives shared memory, and its expiry setting removes old rows automatically.
+
+## Failing safely
+
+The rule is **fail open**: if the gateway has a problem, the alert still goes out. Retries handle PagerDuty rate limits and short outages. If the gateway itself were down, the original direct integration is still there, so rolling back is only a webhook change.
+
+## Adding the next tool
+
+New alert sources are added with one block of configuration that says where the status, host and URL sit in the payload. No code change, and a test with an invented service proves it.
+
+## Serverless or container?
+
+I designed both. They behave the same. I picked serverless because there is nothing to run and it costs almost nothing at our volume. Always check current cloud pricing before quoting numbers, because my figures were list-price estimates.
+
+The takeaway: if a paid feature only transforms data, you can often do that transformation yourself, one step earlier, and keep the platform simple.

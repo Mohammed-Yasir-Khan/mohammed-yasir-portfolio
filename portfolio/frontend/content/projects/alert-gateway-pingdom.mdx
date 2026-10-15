@@ -1,0 +1,69 @@
+---
+title: Alert Gateway for Pingdom and Uptime Kuma
+summary: "A small serverless gateway that sits in front of PagerDuty and groups related monitoring alerts into one clean incident, so the paid AIOps add-on can be switched off."
+year: "2026"
+category: "SRE // ALERTING"
+roles: [sre, devops]
+tags: [AWS Lambda, API Gateway, DynamoDB, Terraform, PagerDuty, Pingdom]
+flow: ["Pingdom / Uptime Kuma", "API Gateway", "Lambda + DynamoDB", "PagerDuty"]
+sample: false
+featured: true
+order: 2
+links: []
+---
+
+## The problem
+
+Our uptime checks (Pingdom and Uptime Kuma) send an alert to PagerDuty whenever a URL goes down. When many URLs of one environment fail together, nobody wants ten separate pages. They want one incident that lists everything affected.
+
+That grouping, and a rewrite of the messy alert title, only worked because of **PagerDuty AIOps**, a paid add-on. Management wanted it switched off. If we simply turned it off, every URL would become its own incident again and the titles would break.
+
+## The idea
+
+Do the same work **earlier**, before the alert reaches PagerDuty. The gateway fixes the title, works out the environment and builds a grouping key. PagerDuty then groups alerts using its own built-in, free deduplication key. No AIOps is needed because PagerDuty receives data that is already correct.
+
+## How an alert travels
+
+<Arch title="Architecture: from a failing URL to one PagerDuty incident" layers={[
+  { label: "Sources", link: "none", gap: "webhook: HTTPS POST with a secret header", nodes: [{ t: "Pingdom", tone: "accent" }, { t: "Uptime Kuma", tone: "accent" }, { t: "Any future tool", sub: "added with config only", tone: "ext" }] },
+  { label: "Gateway (AWS)", nodes: [{ t: "API Gateway", sub: "front door: checks the secret, picks the source" }, { t: "Lambda", sub: "parse, find environment, build title and key", tone: "accent" }, { t: "DynamoDB", sub: "5-minute memory of down URLs, expires by itself", tone: "ext" }], gap: "the final, already-correct event (Events API v2)" },
+  { label: "PagerDuty", nodes: [{ t: "Events API v2", sub: "free on every plan" }, { t: "One incident per environment", sub: "merged by the dedup key", tone: "status" }] },
+]} />
+
+What the Lambda does for every alert:
+
+<Arch title="Inside the Lambda: six steps" layers={[
+  { label: "Understand", nodes: [{ t: "1. Parse", sub: "any source into one shape" }, { t: "2. Find the environment", sub: "from hostname or tags" }, { t: "3. Build a clean title", sub: "P1 | staging | URL Down | url" }], gap: "then group and send" },
+  { label: "Group and send", nodes: [{ t: "4. Make the grouping key", sub: "environment + severity" }, { t: "5. Update the 5-minute window", sub: "every URL currently down" }, { t: "6. Send to PagerDuty", sub: "trigger or resolve", tone: "status" }] },
+]} />
+
+DynamoDB is needed because Lambda has no memory between calls. A time-to-live setting on each row gives the 5-minute window for free.
+
+## Why it is safe
+
+The main rule is **fail open**. If anything inside the gateway breaks, the alert still goes to PagerDuty. A few extra incidents are better than a missed outage.
+
+| What breaks | What happens |
+|---|---|
+| PagerDuty is rate limiting or has a short outage | Retries with growing delays |
+| DynamoDB is slow or down | The alert is sent anyway, with less grouping for a short time |
+| A bad request body | Returns an error and logs it, other alerts are not affected |
+| Someone posts fake alerts | The secret header check rejects them |
+| The same webhook arrives twice | The deduplication key stops a double page |
+| The whole gateway is down | The original direct integration is kept as a fallback, and switching back is just a webhook change |
+
+## Adding any new service
+
+New sources are added with **configuration only**, no code. One block in a YAML file says where the status, hostname and URL live in that tool's payload. Grouping, titles and environment detection then work automatically. A test with a made-up service proves it.
+
+## Testing
+
+Offline tests (no real alerts are sent) cover: one URL down, ten URLs in five minutes becoming one incident, two environments staying separate, resolving when the last URL recovers, a new environment, a new service through config, and an unknown source being rejected.
+
+## Choices I compared
+
+I designed two versions: serverless (Lambda, API Gateway, DynamoDB) and a container (always-on service behind a load balancer). Both behave identically. I recommended serverless because there is nothing to run, it scales on its own, and my design estimate was well under a dollar a month at 100,000 events, against roughly twenty-odd dollars for a container with its own load balancer. These are list-price estimates, so check current pricing before quoting them.
+
+## Result
+
+One incident per environment instead of a page per URL, clean readable titles, and one less paid add-on to depend on.

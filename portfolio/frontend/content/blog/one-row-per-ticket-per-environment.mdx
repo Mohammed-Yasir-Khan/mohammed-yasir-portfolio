@@ -1,0 +1,77 @@
+---
+title: "One Row per Ticket per Environment: Building a CI/CD KPI Platform"
+excerpt: Jenkins, ArgoCD and Jira each know part of a deployment. This is how a single fact table made deployment health measurable, and the bugs that shaped it.
+date: 2026-10-03
+tags: [Metrics, PostgreSQL, DORA]
+minutes: 6
+sample: false
+---
+
+"How often do our deployments fail, and why?" sounds easy. It was not, because no single tool had the whole story.
+
+## Everyone sees a different slice
+
+- Jenkins knows if a job passed.
+- ArgoCD knows if the cluster matches Git.
+- Jira knows the ticket, but its status history is hard to analyse.
+
+To combine them I needed one definition of "a deployment".
+
+## The fact grain
+
+I chose **one row per Jira ticket per environment**. If a ticket moves through staging and production, that is two rows. Each has its own created time, closed time, stage durations and outcome.
+
+I also counted only deployment subtasks. Parent release tickets track planning, not a deployment attempt, so including them makes the failure rate look better than it is.
+
+## Architecture
+
+Two small pictures: the grain itself, and the pipeline that fills it.
+
+<Arch title="The fact grain: one row per ticket per environment" layers={[
+  { label: "Jira", after: "arrow", gap: "splits by environment", nodes: [{ t: "One deployment ticket", tone: "accent" }] },
+  { label: "Fact table", link: "none", nodes: [{ t: "Row: ticket x staging", sub: "own clock, stages and outcome", tone: "status" }, { t: "Row: ticket x production", sub: "own clock, stages and outcome", tone: "status" }] },
+]} />
+
+<Arch title="The pipeline: from Jira to a dashboard" layers={[
+  { label: "Sources", link: "none", gap: "scheduled ingestion", nodes: [{ t: "Jira tickets and status history", tone: "accent" }, { t: "PagerDuty incidents", tone: "accent" }] },
+  { label: "Load", nodes: [{ t: "Normalise" }, { t: "Upsert", sub: "safe to repeat" }, { t: "PostgreSQL", tone: "ext" }], gap: "metrics computed in SQL" },
+  { label: "Serve", nodes: [{ t: "FastAPI" }, { t: "Dashboard", tone: "status" }] },
+]} />
+
+## Which date does a number belong to?
+
+This is where metrics usually go wrong. My rules:
+
+| Number | Counted in the period of |
+|---|---|
+| Opened | when the ticket was created |
+| Completed, success rate | when it first reached a final status |
+| Lead time | when it was closed, completed tickets only |
+| Failures | when the failure happened |
+
+A ticket created in January and closed in February is opened in January and completed in February. That is correct, and it avoids rewriting last month when a failure appears later.
+
+## Four bugs that taught me the most
+
+**1. Backwards scanning.** One ticket showed 160 hours of lead time instead of about 19. I was reading status history from the end, so I found the last failure after a retry. Reading forward finds the first time it finished.
+
+**2. Vanishing retries.** A deployment that failed five times and then passed counted as a perfect success. A second table that stores every failure event fixed this.
+
+**3. Timezones.** Grouping by month in a local timezone moved records across month borders. Setting UTC for every database session fixed it.
+
+**4. Connection pool.** The dashboard runs several queries at once, and two users used up a pool of ten connections. A larger pool and a retry on dropped connections fixed it.
+
+## Percentiles are special
+
+Median and the slow tail (p95, p99) cannot be averaged across buckets. The API asks the database to compute them over raw rows every time.
+
+## Loading data safely
+
+The ingestion job runs often and starts one day before its last successful run. Every write is an upsert, so repeating a row is harmless. That means a failed run can simply be run again.
+
+## Takeaways
+
+1. Decide the unit of measure first, then everything else is simple.
+2. Be strict about which date each number belongs to.
+3. Keep raw events, not only final outcomes, or retries disappear.
+4. Use UTC everywhere.

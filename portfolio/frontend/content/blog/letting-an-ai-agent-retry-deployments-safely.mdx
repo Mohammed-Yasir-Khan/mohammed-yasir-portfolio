@@ -1,0 +1,64 @@
+---
+title: Letting an AI Agent Retry Failed Deployments, Safely
+excerpt: The model decides, but plain code acts. How I put guardrails around an agent that fixes flaky deployment failures.
+date: 2026-09-26
+tags: [AI Agents, Reliability, Guardrails]
+minutes: 5
+sample: false
+---
+
+Many failed deployments are not real bugs. The registry hiccuped, the network blinked, a build was flaky. A person retries it and it works. I built an agent to do that retry, and the interesting part was not the AI. It was the safety.
+
+## Start by watching humans
+
+Before writing code, I read the history of tickets that engineers had retried by hand. The retry was not a pipeline button. It was a Jira status change, back to Backlog and then forward to Pre-Deploy, which restarts the pipeline through automation that already exists. That was the exact action to copy.
+
+## The model never touches production
+
+The agent decides if a retry is safe. It cannot change Jira. It can only ask a small, boring AWS Lambda to do it. If the model makes things up or is fooled by an odd ticket description, the worst case is a wasted request, not the wrong ticket being moved.
+
+## Two checks are better than one
+
+After the agent decides, the Lambda checks again, from scratch:
+
+1. Is this retry path enabled in code?
+2. Is another retry already running? A short lock prevents double firing.
+3. Is the ticket still in the failed status I expect right now?
+
+Only if all three pass does it act. The agent supplies the smart part and the Lambda supplies the safe part.
+
+## Architecture
+
+<Arch title="The agent decides, the Lambda acts" layers={[
+  { label: "Trigger", nodes: [{ t: "Deployment fails", tone: "warn" }, { t: "Corrective ticket opened by the investigation agent" }], gap: "agent polls open tickets" },
+  { label: "Agent (read-only)", nodes: [{ t: "Read live ticket status and failure type" }, { t: "Decide: safe to retry?", tone: "accent" }], gap: "only if yes" },
+  { label: "Lambda (acts)", nodes: [{ t: "Path enabled?" }, { t: "Lock free?" }, { t: "Still failed?" }, { t: "Backlog, then Pre-Deploy", tone: "status" }], gap: "10 to 15 minutes later" },
+  { label: "Follow-up", nodes: [{ t: "Did it move on?" }, { t: "Record the outcome", sub: "retry up to three attempts, then a human", tone: "ext" }] },
+]} />
+
+## Rules written in code, not in the prompt
+
+A prompt can be ignored. Code cannot. The gates include:
+
+- Only certain failure types, such as registry or network problems, are eligible. Real code or config bugs are never retried.
+- Only status paths seen in real tickets are enabled. Unknown ones stay off until proven.
+- At most three attempts in total.
+- Only non-production environments.
+- If the model says "retry" but did not read the live ticket, or never confirmed that the blamed system recovered, the code flips the answer to no.
+
+## Checking the outcome
+
+Ten to fifteen minutes after a retry, a follow-up check looks at the ticket. Did it move forward? Mark success. Did it fail again? Mark failed, comment on the ticket and let the agent decide whether another attempt is allowed. After the limit, a human takes over.
+
+## Everything is recorded
+
+Each decision, the reason, and every retry are stored, and a dashboard tab shows them. When something odd happens, there is always a trail to read.
+
+## Lessons
+
+- Let the model reason, but let deterministic code have the final word.
+- Automate what people really do, not what the documentation says.
+- Keep uncertain cases switched off until real outcomes prove them.
+- Design so the worst mistake is cheap.
+
+An agent you can trust is mostly a set of small, boring rules around a clever model.

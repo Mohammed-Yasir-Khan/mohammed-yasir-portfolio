@@ -1,0 +1,68 @@
+---
+title: How I Automated Weekly, Minor and Major Releases with Jenkins
+excerpt: A release used to be a long checklist of snoozing alerts, pausing tests and moving tickets by hand. Here is how I turned it into one job, and the design choices that made it safe.
+date: 2026-10-14
+tags: [Jenkins, Release Management, Automation]
+minutes: 6
+sample: false
+---
+
+A release is mostly waiting and checking. The risky part is not the deployment itself, it is the many small steps around it that someone has to remember in the right order.
+
+## The checklist I wanted to delete
+
+Before and after every release, an engineer had to snooze monitoring, pause test automation, switch off Jira rules, move tickets batch by batch, and then undo all of it. Miss one step and you get an alert storm, a half-restored system or a release that quietly did not run.
+
+## Rule 1: one entry point
+
+I built one Jenkins job per release type. Each one is the only thing a person needs to touch.
+
+- **Weekly patch:** runs by itself on a schedule, one run per environment.
+- **Minor release:** one master job with a single choice, `SNOOZE` to prepare and release, or `UNSNOOZE` to restore.
+- **Major release:** its own master job for one environment, with extra steps like the maintenance page and service shutdown.
+
+## Rule 2: conductors, not workers
+
+The master jobs do not contain release logic. They only start the jobs that already exist (snooze, test automation pause, Jira toggle, batch release) in the right order and pass the result along. That kept everything small and meant each child job stayed useful on its own.
+
+## Rule 3: rehearse first
+
+Every job starts in **dry run**. It prints exactly what it would do and sends a preview notification, but changes nothing. Going live is a deliberate extra tick. This one default removed most of the fear around releases.
+
+## Rule 4: a blocked ticket should pause the release, not kill it
+
+During a batch, some tickets fail for fixable reasons. My first instinct was to fail the job. That is wrong, because a person then has to start over.
+
+Instead the batch engine tells the on-call engineer the likely root cause, **waits**, and carries on automatically once the ticket recovers. A time budget is the only hard stop, and a state file lets a re-run skip batches that already finished.
+
+## Rule 5: never leave monitoring muted
+
+If any snooze step fails halfway, the wrapper un-silences every tool it touched. A failed release is bad, but a release that leaves production alerts muted is worse.
+
+## A bug worth remembering
+
+People paste a Jira filter into the job. If that filter includes `status = Backlog`, the batch looks empty the moment tickets move forward, and the engine decides "batch complete" far too early. Now the job strips status and batch clauses from the pasted filter before it starts, so any reasonable filter behaves the same.
+
+## Architecture
+
+The weekly patch job is the simplest one, so it is the best place to see the shape of the idea. The minor release is the same idea with a conductor on top.
+
+<Arch title="Weekly patch release: one job per environment" layers={[
+  { label: "Trigger", nodes: [{ t: "Schedule", sub: "fixed weekly windows", tone: "accent" }, { t: "Time-window check", sub: "refuses a real run outside its window" }, { t: "Dry run?", sub: "on by default" }], gap: "four steps, always in this order" },
+  { label: "Release", nodes: [{ t: "1. Snooze" }, { t: "2. Deploy patches", sub: "wait for the first test level" }, { t: "3. Unsnooze" }, { t: "4. Verify and report", tone: "status" }] },
+]} />
+
+<Arch title="Minor release: a conductor and its child jobs" layers={[
+  { label: "You press", after: "none", nodes: [{ t: "Master job", sub: "ACTION = SNOOZE or UNSNOOZE", tone: "accent" }] },
+  { label: "SNOOZE", gap: "stops at the first failure before the batch step", nodes: [{ t: "Snooze alerts" }, { t: "Pause test automation" }, { t: "Disable Jira rules" }, { t: "Batch engine", tone: "status" }] },
+  { label: "UNSNOOZE", nodes: [{ t: "Enable Jira rules" }, { t: "Unpause test automation" }, { t: "Unsnooze alerts" }] },
+]} />
+
+The major release is the same conductor with a maintenance page and an ordered service shutdown and restore added around the batches.
+
+## What I would improve
+
+- Automatic rollback of earlier steps after a failure. Today the master stops and the restore action cleans up.
+- Less hard-coded configuration, more of it in config files.
+
+If you automate releases, start with the dry-run default, make failures pause instead of crash, and always restore the things you changed.

@@ -1,0 +1,75 @@
+---
+title: CI/CD KPI Platform
+summary: "One place that answers how healthy our deployments are: success rate, lead time, failure reasons and change failure rate, by environment and service."
+year: "2026"
+category: "SRE // ENGINEERING METRICS"
+roles: [sre, devops, ai]
+tags: [Python, FastAPI, PostgreSQL, Next.js, Jira, OpenShift, Helm]
+flow: ["Jira + pipeline data", "Ingestion", "PostgreSQL facts", "API + dashboard"]
+sample: false
+featured: true
+order: 3
+links: []
+---
+
+## The problem
+
+Each tool only sees its own slice of a deployment:
+
+- Jenkins and Tekton know whether a job passed, but not which release or environment it belongs to.
+- ArgoCD knows whether the cluster is in sync, but not how long the change took.
+- Jira holds the real unit of work, the ticket, but its statuses are not easy to analyse.
+
+So a simple question like "how often do our deployments fail, and why?" had no trustworthy answer.
+
+## The key idea: one row per ticket per environment
+
+Everything is built on a single fact: **one row for each (Jira ticket, environment)**. A ticket that goes through staging and production becomes two rows, each with its own clock, stage times and outcome. Only deployment subtasks are counted, so parent release tickets do not distort the success rate.
+
+## The numbers it produces
+
+| Metric | Plain meaning |
+|---|---|
+| Opened | How many deployments were requested |
+| Completed | How many finished (success, failed or cancelled) |
+| Success rate | Share that succeeded |
+| Lead time | How long from created to closed, shown as median and the slow tail (p50, p95, p99) |
+| Stage durations | Where the time goes: waiting, build, deploy, verification |
+| Failure mix | Why deployments fail |
+| Change failure rate | Share of changes that caused a failure |
+| Open aging | How long unfinished tickets have been waiting |
+
+## How it works
+
+<Arch title="Architecture: from Jira tickets to a dashboard" layers={[
+  { label: "Sources", link: "none", gap: "scheduled ingestion, about every 15 minutes", nodes: [{ t: "Jira tickets and status history", tone: "accent" }, { t: "PagerDuty incidents", tone: "accent" }] },
+  { label: "Ingestion (Python)", nodes: [{ t: "Read ticket history" }, { t: "Normalise to (ticket, environment) rows" }, { t: "Upsert, safe to repeat", sub: "starts one day before the last good run" }], gap: "facts and events" },
+  { label: "Storage", link: "none", gap: "metrics are computed in SQL", nodes: [{ t: "PostgreSQL", sub: "fact table, failure events, incidents", tone: "ext" }] },
+  { label: "Serve", nodes: [{ t: "FastAPI", sub: "percentiles, rates, exports" }, { t: "Next.js dashboard", sub: "overview, scorecard, failures, lead time, open tickets", tone: "status" }] },
+]} />
+
+Everything runs on OpenShift and is deployed with Helm. The API and dashboard are always on, and the ingestion and agents run as scheduled jobs.
+
+## Lessons from real bugs
+
+These are the problems that taught the most:
+
+- **Lead time looked far too long.** One ticket showed about 160 hours instead of about 19. The code was reading status history from the end, so it picked the last time a ticket failed after a retry, not the first time it finished. Reading history in time order fixed it.
+- **Retried failures disappeared.** A deployment that failed five times and then passed looked like a clean success. I added a separate table that records every failure event, so retries stay visible.
+- **Month totals were wrong near month end.** The database used a local timezone when grouping by month, which pushed some records into the wrong month. Forcing UTC for every session fixed it.
+- **The dashboard crashed with two users.** One page runs several queries at once and used up the small connection pool. A bigger pool and a retry on dropped connections solved it.
+- **Percentiles cannot be averaged.** They are calculated directly in the database over the raw rows, never from pre-summed buckets.
+
+## Alert noise on the same dashboard
+
+The scorecard also collapses repeated firing of the same alert into one episode when the gap is under an hour, and ranks flapping alerts separately for each severity. That way a storm of low-priority alerts cannot hide a high-priority one.
+
+## Agents around it
+
+The same platform feeds a small group of agents that read this data: one investigates failures, one retries safe ones (see the Workaround Agent project), and one proposes missing alert rules. They never call each other. They only read and write shared database tables, so one agent failing cannot cascade into the others.
+
+<Arch title="Agents around the platform: shared state, no direct calls" layers={[
+  { label: "Agents", link: "none", gap: "read and write shared tables", nodes: [{ t: "RCA agent", sub: "finds why a deployment failed", tone: "accent" }, { t: "Workaround agent", sub: "retries safe, temporary failures", tone: "accent" }, { t: "Monitoring agent", sub: "proposes missing alert rules", tone: "accent" }] },
+  { label: "Shared state", link: "none", nodes: [{ t: "PostgreSQL", sub: "the only way the agents talk to each other", tone: "ext" }] },
+]} />
+

@@ -1,0 +1,71 @@
+---
+title: Workaround Agent
+summary: "An AI agent that spots deployment failures caused by flaky infrastructure and safely retries them, while strict code gates stop it from ever doing anything risky."
+year: "2026"
+category: "AI // OPERATIONS"
+roles: [ai, sre]
+tags: [Python, LLM, AWS Lambda, Jira, PostgreSQL]
+flow: ["Failed deployment", "Agent decides", "Safe Lambda retries", "Outcome checked"]
+sample: false
+featured: true
+order: 4
+links: []
+---
+
+## The problem
+
+When a deployment fails, an investigation agent writes up the root cause and opens a corrective ticket. A large share of those failures are **temporary and external**: the image registry had a hiccup, the network blipped, or a build was flaky. The ticket already says what a person would do next: check the external system recovered, then retry the same deployment.
+
+A human did that retry by hand, every time. It is boring work that does not need a human's judgment.
+
+## What a person actually does
+
+I traced real ticket histories to see exactly what engineers do. The retry is not a button in the pipeline. It is a **status change in Jira**: move the ticket back to Backlog, then forward to Pre-Deploy. Automation that is already wired to Jira status changes then restarts the pipeline by itself.
+
+Jira has no direct step from the failed status to Pre-Deploy, so the path goes through Backlog. I only automated paths I had seen people use.
+
+## The design: the agent decides, a separate function acts
+
+The most important rule: **the AI never changes Jira itself.** It can only ask a separate, plain, deterministic AWS Lambda to do it.
+
+<Arch title="Architecture: the agent decides, the Lambda acts" layers={[
+  { label: "Trigger", nodes: [{ t: "Deployment fails", tone: "warn" }, { t: "Investigation agent writes the root cause and opens a corrective ticket" }], gap: "workaround agent polls open tickets" },
+  { label: "Agent (read-only)", nodes: [{ t: "Read the live ticket status" }, { t: "Read the failure type" }, { t: "Decide: safe to retry?", sub: "model suggests, code gate can overrule", tone: "accent" }], gap: "only if yes: webhook call to the Lambda" },
+  { label: "Lambda (acts)", nodes: [{ t: "Retry path enabled?" }, { t: "No other retry running?", sub: "short lock" }, { t: "Still in the failed status?", sub: "live re-check" }, { t: "Move ticket: Backlog, then Pre-Deploy", tone: "status" }], gap: "10 to 15 minutes later" },
+  { label: "Follow-up", nodes: [{ t: "Check: did the ticket move on?" }], gap: "write the result back", after: "arrow" },
+  { label: "Outcome", link: "none", nodes: [{ t: "Success", sub: "comment on the ticket and record it", tone: "status" }, { t: "Failed", sub: "record it. The agent may retry, up to three attempts, then a human takes over", tone: "warn" }] },
+]} />
+
+Every change has to pass this chain, and the model cannot skip any link of it:
+
+<Arch title="Safety chain: who can say no" layers={[
+  { label: "Decision", nodes: [{ t: "Model suggests a retry", sub: "probabilistic" }, { t: "Agent code gate", sub: "must have read the live ticket and confirmed the blamed system recovered", tone: "accent" }, { t: "Lambda re-verifies alone", sub: "path enabled, lock free, status unchanged", tone: "accent" }, { t: "Jira status changes", sub: "the only production change", tone: "status" }] },
+]} />
+
+
+The reason for two checks: the agent adds the "smart" part, and the Lambda adds the "safe" part. If the model hallucinates a ticket ID or is tricked by a strange description, the worst outcome is a wasted webhook call, never the wrong ticket being changed.
+
+## The guardrails
+
+| Guardrail | What it prevents |
+|---|---|
+| Only certain failure types (registry and network) | Retrying real code or config bugs, which would just waste a deployment slot |
+| Only paths confirmed against real tickets | Guessing the workflow. Unconfirmed statuses stay disabled in code |
+| At most three attempts in total | Endless retry loops |
+| Non-production environments only | Touching production |
+| A code gate that can overrule the model | The model saying "retry" without reading the live ticket or confirming the blamed system recovered |
+| A short lock | Two retries firing at once |
+| Full audit trail | Every decision and every retry is stored and shown on a dashboard tab |
+
+The model is also run at a low temperature so decisions are repeatable.
+
+## What I learned
+
+- Never let a probabilistic model be the last line of defense. Put a deterministic check after it and let that check win.
+- Watch what humans really do before automating. The Jira hop through Backlog was only visible in real histories.
+- Keep unconfirmed cases switched off until real outcomes prove them.
+- Give the agent small blast radius by design: the worst case should be a wasted call.
+
+## Where it fits
+
+It is one of three agents sharing the same database: one investigates failures, one retries safe ones, and one proposes alert rules that were missing. They never call each other directly. They only read and write shared tables, which avoids chains of failures between agents.

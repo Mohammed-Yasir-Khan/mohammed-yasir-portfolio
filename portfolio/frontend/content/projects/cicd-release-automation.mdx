@@ -1,0 +1,135 @@
+---
+title: CI/CD Release Automation
+summary: "Weekly patch, minor and major releases run from one Jenkins job each, with dry-run safety, a single notification stream and automatic recovery when a ticket gets blocked."
+year: "2026"
+category: "DEVOPS // RELEASE AUTOMATION"
+roles: [devops, sre]
+tags: [Jenkins, Python, Jira, ArgoCD, Datadog, Pingdom]
+flow: ["Schedule or one click", "Snooze alerts", "Deploy in batches", "Verify and report"]
+sample: false
+featured: true
+order: 1
+links: []
+---
+
+## The problem
+
+Every release used to be a long manual checklist for the SRE team:
+
+1. Snooze monitoring, otherwise the deployments trigger an alert storm.
+2. Pause the test automation pipelines so they do not run in the middle of the release.
+3. Switch off the Jira automation rules that would interfere.
+4. Move release tickets forward batch by batch, watch each batch deploy, and stop to fix anything that fails.
+5. Undo all of the above afterwards.
+
+It was slow, repetitive and easy to get wrong at 2 a.m. The goal was simple: run a whole release from one place, safely, with clear notifications.
+
+## What I built
+
+There are three release types. Each has its own Jenkins job, and they share the same building blocks.
+
+### Weekly patch release
+
+One job per environment, started by a schedule, so nobody has to remember to trigger it. It runs four steps:
+
+1. **Snooze** monitoring for the release window.
+2. **Deploy patches:** pick up this week's patch tickets, move them from Backlog to Pre-Deploy in bulk, then wait until each one reaches the first test level (L0).
+3. **Unsnooze** monitoring.
+4. **Verify and report:** check that the backlog is empty, nothing is still snoozed and L0 is at 100 percent, then build an Excel report.
+
+The job only asks for two inputs: the environment and a dry-run switch. Dry run is on by default, so a rehearsal changes nothing in Jira and snoozes nothing. Each run labels itself with its own date and time, so two runs in the same week never collide.
+
+### Minor release
+
+A single **master wrapper** job takes one action, either `SNOOZE` (prepare and release) or `UNSNOOZE` (restore). It then triggers the existing child jobs in the right order:
+
+The exact order is in the architecture diagrams below.
+
+The master has no business logic of its own. It only conducts jobs that already exist, so each one is still usable on its own. Every section is optional: leave its input empty and that step is skipped.
+
+### Major release
+
+A separate master wrapper for one environment. It reuses the same child jobs and adds what only a major release needs: turn the maintenance page on, shut services down in a set order, deploy in batches, restore the services, run the first test level, validate, then turn the maintenance page off. The whole flow is listed in a config file, so the order can change without touching code.
+
+## The batch engine
+
+This Python script is the heart of the minor and major releases.
+
+- You give it one release filter and an ordered list of batches.
+- For each batch it moves the tickets to Pre-Deploy, then checks Jira every 10 seconds.
+- Each ticket status falls into a bucket: **blocked** (a deployment failed), **approval gate** (a validation gate failed), **pending**, or **done**.
+- A batch is finished when nothing is pending, blocked or waiting on approval. Then it moves to the next batch.
+
+### What happens when something breaks
+
+A failed ticket does **not** crash the release. The engine sends the on-call engineer the likely root cause (taken from the latest automation comment, with links to the pipeline), then waits. As soon as the ticket is fixed, it carries on by itself. A time budget is the only hard stop.
+
+Approval-gate failures get the standard exception approval applied automatically, and the engineer is told.
+
+## Architecture
+
+### Weekly patch release
+
+One job per environment. It starts from a schedule and always finishes with a verification and a report.
+
+<Arch title="Weekly patch release: one Jenkins job per environment" layers={[
+  { label: "Trigger", nodes: [{ t: "Weekly schedule", sub: "fixed windows, nobody clicks", tone: "accent" }, { t: "Time-window check", sub: "a real run outside its window is refused" }, { t: "Dry run?", sub: "on by default, nothing changes" }], gap: "four steps, always in this order" },
+  { label: "Release", nodes: [{ t: "1. Snooze monitoring" }, { t: "2. Deploy patches", sub: "promote this week's patch tickets, move Backlog to Pre-Deploy, wait for L0" }, { t: "3. Unsnooze monitoring" }, { t: "4. Verify and report", sub: "backlog empty, nothing snoozed, L0 at 100%", tone: "status" }], gap: "every run leaves evidence" },
+  { label: "Output", link: "none", nodes: [{ t: "Excel report", sub: "9 sheets: summary, tickets, failures, queries used", tone: "ext" }, { t: "Build result", sub: "SUCCESS or FAILURE. A warning email if L0 needs attention", tone: "ext" }] },
+]} />
+
+### Minor release
+
+One master job conducts the existing child jobs. The two actions are alternatives, so they are separate rows.
+
+<Arch title="Minor release: master wrapper and its child jobs" layers={[
+  { label: "You press", after: "none", nodes: [{ t: "Minor-release master job", sub: "ACTION = SNOOZE or UNSNOOZE. DRY_RUN is on by default", tone: "accent" }] },
+  { label: "SNOOZE (release)", gap: "stops at the first failure before the batch step", nodes: [{ t: "1. Snooze alerts", sub: "Datadog, Alertmanager, Pingdom" }, { t: "2. Pause test automation" }, { t: "3. Disable Jira rules" }, { t: "4. Batch release engine", tone: "status" }] },
+  { label: "UNSNOOZE (restore)", after: "none", nodes: [{ t: "1. Enable Jira rules" }, { t: "2. Unpause test automation" }, { t: "3. Unsnooze alerts" }] },
+  { label: "Notifications", link: "none", nodes: [{ t: "One stream from the master", sub: "starting, done, failed (Teams and email)", tone: "ext" }, { t: "Batch engine keeps its own detail", sub: "per-ticket root cause alerts", tone: "ext" }] },
+]} />
+
+### Batch engine
+
+The Python script that moves tickets through a release, batch by batch.
+
+<Arch title="Batch engine: what happens for every batch" layers={[
+  { label: "Input", link: "none", nodes: [{ t: "Release filter", sub: "one Jira filter, pasted by the SRE", tone: "accent" }, { t: "Ordered batch list", sub: "run one after another" }], gap: "clean up the filter first" },
+  { label: "Clean-up", nodes: [{ t: "Remove status and batch clauses", sub: "so the poller never goes blind once tickets move" }], gap: "then, for each batch" },
+  { label: "Loop", nodes: [{ t: "Search tickets" }, { t: "Move Backlog to Pre-Deploy" }, { t: "Check Jira every 10 seconds" }, { t: "Sort every ticket by status" }], gap: "each ticket falls into one bucket" },
+  { label: "Buckets", link: "none", nodes: [{ t: "Blocked", sub: "tell SRE the root cause, wait, resume by itself", tone: "warn" }, { t: "Approval gate failed", sub: "apply the exception approval, keep polling" }, { t: "Pending", sub: "keep waiting" }, { t: "Done", sub: "go to the next batch", tone: "status" }], after: "none" },
+  { label: "Safety", link: "none", nodes: [{ t: "State file", sub: "a re-run skips finished batches", tone: "ext" }, { t: "Time budget", sub: "the only hard stop", tone: "ext" }] },
+]} />
+
+### Major release
+
+The major release adds the maintenance page and an ordered shutdown and restore of services. The flow is listed in a config file.
+
+<Arch title="Major release: one environment, end to end" layers={[
+  { label: "Prepare", gap: "inside the scheduled window only", nodes: [{ t: "Maintenance page ON", tone: "accent" }, { t: "Snooze alerts" }, { t: "Pause test automation" }, { t: "Pause Jira rules" }] },
+  { label: "Release", gap: "same batch engine as the minor release", nodes: [{ t: "Shut services down", sub: "in a set order, replica counts saved" }, { t: "Optional HA step", sub: "only when a service is onboarded or removed" }, { t: "Deploy in batches" }, { t: "Restore services", sub: "back to the saved replica counts" }] },
+  { label: "Finish", nodes: [{ t: "First test level (L0)" }, { t: "Validate" }, { t: "Unpause tests, unsnooze, re-enable Jira rules" }, { t: "Report, maintenance page OFF", tone: "status" }] },
+]} />
+
+## Design decisions
+
+| Decision | Why |
+|---|---|
+| Master wrappers only trigger existing jobs | No copied logic, and each job stays independently useful |
+| Dry run is on by default | Nobody changes production by accident |
+| Wait and resume instead of fail | A fixable failure should not force a full re-run |
+| Resume from a state file | A re-run skips batches that already finished |
+| Clean up the pasted filter automatically | A filter that includes a status clause blinds the poller once tickets move on, and the batch would look complete too early. Stripping it fixed that class of bug |
+| One notification stream from the master | Starting, done and failed messages without duplicates |
+| Time-window governance | A real run outside its allowed window is refused |
+| Settings live in config files | Moving a window or changing a status needs no code change |
+
+## Safety and limits
+
+- If a snooze step fails, the snooze wrapper un-silences every tool it touched, so monitoring is never left muted.
+- A failure before the batch step stops the master immediately. It does not roll back earlier steps yet, by design, so the system might be partly prepared. The restore action cleans that up.
+- Some checks report "not verified" instead of passing when the job cannot read the data. The report never claims a pass it could not prove.
+
+## Result
+
+Releases that needed a person clicking through many steps now run from a schedule or one button, with the same checks every time and a report at the end.

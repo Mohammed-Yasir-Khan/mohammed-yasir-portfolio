@@ -61,11 +61,17 @@ def _send_smtp(data: ContactIn) -> None:
 
 
 def _save_locally(data: ContactIn) -> None:
-    out = BASE_DIR / "data"
-    out.mkdir(exist_ok=True)
-    record = data.model_dump(exclude={"website"}) | {"received_at": datetime.now(timezone.utc).isoformat()}
-    with (out / "messages.jsonl").open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
+    # Vercel serverless mein file system read-only hota hai, isliye crash hone se bachne ke liye try-except lagayein
+    try:
+        out = BASE_DIR / "data"
+        out.mkdir(exist_ok=True)
+        record = data.model_dump(exclude={"website"}) | {"received_at": datetime.now(timezone.utc).isoformat()}
+        with (out / "messages.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        log.warning(f"Could not save locally (Read-only environment): {e}")
+        # Vercel par local write fail hone par bhi request ko fail mat hone do
+        pass
 
 
 @router.post("/contact")
